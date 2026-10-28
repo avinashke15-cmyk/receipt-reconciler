@@ -2,13 +2,46 @@ const express=require('express'),cors=require('cors'),multer=require('multer'),f
 const {receiptFromOcr}=require('./receipt-ocr');
 const app=express();app.use(cors());app.use(express.json());const base=path.join(__dirname,'..');fs.mkdirSync(path.join(base,'uploads'),{recursive:true});const db=new Database(path.join(base,'reconciler.sqlite'));db.pragma('foreign_keys=ON');db.exec(fs.readFileSync(path.join(__dirname,'schema.sql'),'utf8'));
 const images=multer({dest:path.join(base,'uploads'),limits:{fileSize:12e6},fileFilter:(_q,f,cb)=>cb(null,/^image\/(png|jpeg|webp|bmp)$/.test(f.mimetype))});const csvUpload=multer({storage:multer.memoryStorage(),limits:{fileSize:5e6}});
+// This is a single-user application: resetting removes every saved batch and uploaded file.
+const resetDatabase=db.transaction(()=>{
+ db.prepare('DELETE FROM reconciliation_matches').run();
+ db.prepare('DELETE FROM reconciliation_runs').run();
+ db.prepare('DELETE FROM statement_lines').run();
+ db.prepare('DELETE FROM statement_imports').run();
+ db.prepare('DELETE FROM receipts').run();
+});
+const clearRuns=db.transaction(()=>{db.prepare('DELETE FROM reconciliation_matches').run();db.prepare('DELETE FROM reconciliation_runs').run()});
+function removeFiles(paths){for(const p of paths){try{fs.unlinkSync(p)}catch(e){if(e.code!=='ENOENT')console.error('Could not remove upload',e)}}}
+app.post('/api/reset',(_q,s)=>{
+ try{const paths=db.prepare('SELECT image_path FROM receipts').all().map(x=>x.image_path);resetDatabase();removeFiles(paths);s.json({ok:true,deleted:true})}
+ catch(e){console.error(e);s.status(500).json({error:'Could not reset saved data'})}
+});
 const money=x=>{if(x===null||x===undefined||String(x).trim()==='')return null;const n=Number(String(x).replace(/[,AED\s]/gi,''));return Number.isFinite(n)&&n>=0?Math.round(n*100):null};
 const iso=s=>{s=String(s||'').trim();let m=s.match(/^(\d{2})\/(\d{2})\/(\d{4})$/);if(m)s=`${m[3]}-${m[2]}-${m[1]}`;if(!/^\d{4}-\d{2}-\d{2}$/.test(s))return null;const d=new Date(s+'T00:00:00Z');return !Number.isNaN(d.getTime())&&d.toISOString().slice(0,10)===s?s:null};
 function serializeReceipt(r){return {...r,date:r.receipt_date,amount_aed:r.amount_minor===null?null:r.amount_minor/100}}function serializeLine(l){return {...l,amount_aed:l.amount_minor/100}}
 app.get('/api/health',(_q,s)=>s.json({ok:true}));app.get('/api/receipts',(_q,s)=>s.json(db.prepare('SELECT * FROM receipts ORDER BY id').all().map(serializeReceipt)));app.get('/api/statement',(_q,s)=>s.json(db.prepare('SELECT * FROM statement_lines WHERE import_id=(SELECT MAX(id) FROM statement_imports) ORDER BY id').all().map(serializeLine)));
-app.post('/api/receipts',images.array('files',40),async(q,s)=>{if(!q.files?.length)return s.status(400).json({error:'Upload receipt images'});const out=[];for(const f of q.files){let t='',status='extracted';try{t=(await Tesseract.recognize(f.path,'eng')).data.text||''}catch(e){status='failed'}const v=receiptFromOcr(t);const info=db.prepare('INSERT INTO receipts(filename,image_path,merchant,receipt_date,amount_minor,card_last4,receipt_number,ocr_text,ocr_status) VALUES(?,?,?,?,?,?,?,?,?)').run(f.originalname,f.path,v.merchant,v.receipt_date,v.amount_minor,v.card_last4,v.receipt_number,t,status);out.push(serializeReceipt(db.prepare('SELECT * FROM receipts WHERE id=?').get(info.lastInsertRowid)))}s.status(201).json(out)});
+app.post('/api/receipts',images.array('files',40),async(q,s)=>{
+ if(!q.files?.length)return s.status(400).json({error:'Upload receipt images'});
+ const extracted=[];
+ try{
+  for(const f of q.files){
+   let t='',status='extracted';
+   try{t=(await Tesseract.recognize(f.path,'eng')).data.text||''}catch(e){status='failed'}
+   extracted.push({f,t,status,v:receiptFromOcr(t)});
+  }
+  const old=db.prepare('SELECT image_path FROM receipts').all().map(x=>x.image_path);
+  const ids=db.transaction(()=>{
+   clearRuns();
+   db.prepare('DELETE FROM receipts').run();
+   const insert=db.prepare('INSERT INTO receipts(filename,image_path,merchant,receipt_date,amount_minor,card_last4,receipt_number,ocr_text,ocr_status) VALUES(?,?,?,?,?,?,?,?,?)');
+   return extracted.map(({f,t,status,v})=>insert.run(f.originalname,f.path,v.merchant,v.receipt_date,v.amount_minor,v.card_last4,v.receipt_number,t,status).lastInsertRowid);
+  })();
+  removeFiles(old);
+  s.status(201).json(ids.map(id=>serializeReceipt(db.prepare('SELECT * FROM receipts WHERE id=?').get(id))));
+ }catch(e){removeFiles(q.files.map(f=>f.path));console.error(e);s.status(500).json({error:'Could not save receipt batch'})}
+});
 app.patch('/api/receipts/:id',(q,s)=>{const r=db.prepare('SELECT * FROM receipts WHERE id=?').get(q.params.id);if(!r)return s.status(404).json({error:'Not found'});const b=q.body;const date=b.date===undefined?r.receipt_date:(b.date?iso(b.date):null),amt=b.amount_aed===undefined?r.amount_minor:money(b.amount_aed),card=b.card_last4===undefined?r.card_last4:(b.card_last4||null);if(b.date&& !date)return s.status(400).json({error:'Invalid date'});if(card&&!/^\d{4}$/.test(card))return s.status(400).json({error:'card_last4 must be four digits'});db.prepare('UPDATE receipts SET merchant=?,receipt_date=?,amount_minor=?,card_last4=?,ocr_status=? WHERE id=?').run(b.merchant===undefined?r.merchant:b.merchant,date,amt,card,'reviewed',r.id);s.json(serializeReceipt(db.prepare('SELECT * FROM receipts WHERE id=?').get(r.id)))});
-app.post('/api/statement',csvUpload.single('file'),(q,s)=>{if(!q.file)return s.status(400).json({error:'Upload CSV'});try{const data=parse(q.file.buffer,{columns:true,skip_empty_lines:true,bom:true,trim:true});const required=['date','description','amount_aed','card_last4','ref'];if(!data.length||Object.keys(data[0]).join(',')!==required.join(','))return s.status(400).json({error:'CSV headers must be exactly: '+required.join(', ')});const prepared=data.map((r,i)=>{if(!iso(r.date)||!r.description||money(r.amount_aed)===null||!/^\d{4}$/.test(r.card_last4)||!r.ref)throw Error('Invalid values at CSV row '+(i+2));return {...r,date:iso(r.date),amount_minor:money(r.amount_aed)}});const importCsv=db.transaction(()=>{const id=db.prepare('INSERT INTO statement_imports(filename) VALUES(?)').run(q.file.originalname).lastInsertRowid;const insert=db.prepare('INSERT INTO statement_lines(import_id,date,description,amount_minor,card_last4,ref) VALUES(?,?,?,?,?,?)');for(const r of prepared)insert.run(id,r.date,r.description,r.amount_minor,r.card_last4,r.ref);return id});const id=importCsv();s.status(201).json(db.prepare('SELECT * FROM statement_lines WHERE import_id=?').all(id).map(serializeLine))}catch(e){s.status(400).json({error:e.message})}});
+app.post('/api/statement',csvUpload.single('file'),(q,s)=>{if(!q.file)return s.status(400).json({error:'Upload CSV'});try{const data=parse(q.file.buffer,{columns:true,skip_empty_lines:true,bom:true,trim:true});const required=['date','description','amount_aed','card_last4','ref'];if(!data.length||Object.keys(data[0]).join(',')!==required.join(','))return s.status(400).json({error:'CSV headers must be exactly: '+required.join(', ')});const prepared=data.map((r,i)=>{if(!iso(r.date)||!r.description||money(r.amount_aed)===null||!/^\d{4}$/.test(r.card_last4)||!r.ref)throw Error('Invalid values at CSV row '+(i+2));return {...r,date:iso(r.date),amount_minor:money(r.amount_aed)}});const importCsv=db.transaction(()=>{clearRuns();db.prepare('DELETE FROM statement_lines').run();db.prepare('DELETE FROM statement_imports').run();const id=db.prepare('INSERT INTO statement_imports(filename) VALUES(?)').run(q.file.originalname).lastInsertRowid;const insert=db.prepare('INSERT INTO statement_lines(import_id,date,description,amount_minor,card_last4,ref) VALUES(?,?,?,?,?,?)');for(const r of prepared)insert.run(id,r.date,r.description,r.amount_minor,r.card_last4,r.ref);return id});const id=importCsv();s.status(201).json(db.prepare('SELECT * FROM statement_lines WHERE import_id=?').all(id).map(serializeLine))}catch(e){s.status(400).json({error:e.message})}});
 app.post('/api/reconcile',(_q,s)=>{const imp=db.prepare('SELECT MAX(id) AS id FROM statement_imports').get().id;if(!imp)return s.status(400).json({error:'Import a statement first'});const rs=db.prepare('SELECT * FROM receipts ORDER BY id').all(),ls=db.prepare('SELECT * FROM statement_lines WHERE import_id=? ORDER BY id').all(imp);const results=reconcile(rs,ls);const save=db.transaction(()=>{const run=db.prepare('INSERT INTO reconciliation_runs(import_id) VALUES(?)').run(imp).lastInsertRowid;const ins=db.prepare('INSERT INTO reconciliation_matches(run_id,receipt_id,statement_line_id,status,reason,confidence) VALUES(?,?,?,?,?,?)');for(const m of results)ins.run(run,m.receipt_id,m.statement_line_id,m.status,m.reason,m.confidence);return run});const runId=save();s.json({run_id:runId,matches:results})});
 app.get('/api/report',(_q,s)=>{const run=db.prepare('SELECT * FROM reconciliation_runs ORDER BY id DESC LIMIT 1').get();if(!run)return s.json({run:null,counts:{matched:0,duplicate:0,missing:0,mismatch:0},matches:[],receipts:[],statementLines:[]});const matches=db.prepare('SELECT * FROM reconciliation_matches WHERE run_id=? ORDER BY id').all(run.id),counts={matched:0,duplicate:0,missing:0,mismatch:0};matches.forEach(x=>counts[x.status]++);s.json({run,counts,matches,receipts:db.prepare('SELECT * FROM receipts').all().map(serializeReceipt),statementLines:db.prepare('SELECT * FROM statement_lines WHERE import_id=?').all(run.import_id).map(serializeLine)})});
 app.listen(process.env.PORT||3000,()=>console.log('API http://localhost:'+(process.env.PORT||3000)));
